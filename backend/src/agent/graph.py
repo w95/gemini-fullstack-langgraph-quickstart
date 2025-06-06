@@ -8,6 +8,9 @@ from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
 from google.genai import Client
+from langchain_openai import ChatOpenAI
+from langchain_core.language_models.chat_models import BaseChatModel
+
 
 from agent.state import (
     OverallState,
@@ -33,13 +36,6 @@ from agent.utils import (
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
-
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates a search queries based on the User's question.
@@ -60,13 +56,30 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    model_name = configurable.query_generator_model
+    llm: BaseChatModel
+
+    if model_name.startswith(("gpt-", "text-davinci-")):
+        openai_api_key = configurable.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY is not set for OpenAI model")
+        llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=openai_api_key,
+            temperature=1.0,
+            max_retries=2,
+        )
+    else:  # Assume Gemini model
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is not set for Gemini model")
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=gemini_api_key,
+            temperature=1.0,
+            max_retries=2,
+        )
+
     structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
@@ -106,32 +119,82 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     """
     # Configure
     configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
+    search_model_name = configurable.query_generator_model # This is the model for summarizing search results
+
+    # For the actual search operation, we always use the google.generativeai Client
+    # as it provides the google_search tool and grounding metadata.
+    gemini_api_key_for_search = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key_for_search:
+        raise ValueError("GEMINI_API_KEY is not set, required for web_research's search tool functionality.")
+
+    # We use the query_generator_model for the search tool itself, as it might be tuned for search.
+    # This client is only for the search part.
+    genai_search_client = Client(api_key=gemini_api_key_for_search)
+
+    search_prompt_for_tool = web_searcher_instructions.format(
         current_date=get_current_date(),
-        research_topic=state["search_query"],
+        research_topic=state["search_query"], # This is the individual query from the list
     )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
+    # Perform the search using Gemini (even if summarization is by OpenAI)
+    search_response = genai_search_client.models.generate_content(
+        model=configurable.query_generator_model, # Use the query_generator_model for the search tool
+        contents=search_prompt_for_tool,
         config={
             "tools": [{"google_search": {}}],
-            "temperature": 0,
+            "temperature": 0, # Low temperature for factual search
         },
     )
-    # resolve the urls to short urls for saving tokens and time
+
+    # Process search results (URL resolution and citation extraction)
     resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
+        search_response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
     )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
+    citations = get_citations(search_response, resolved_urls)
+
+    # Now, generate the actual textual content using the selected LLM
+    # The content from the search tool is in search_response.text
+    search_result_text = search_response.text
+
+    llm_for_summarization: BaseChatModel
+    if search_model_name.startswith(("gpt-", "text-davinci-")):
+        openai_api_key = configurable.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY is not set for OpenAI model selected for web research summarization.")
+        llm_for_summarization = ChatOpenAI(
+            model=search_model_name,
+            openai_api_key=openai_api_key,
+            temperature=0.7, # Allow some creativity in summarization
+            max_retries=2,
+        )
+        # We need to craft a new prompt for OpenAI to summarize/answer based on search_result_text
+        # The original web_searcher_instructions was for the Gemini tool.
+        # For now, we will directly use the search_result_text and then add citations.
+        # A more sophisticated approach might involve a prompt like:
+        # "Based on the following search results: {search_result_text}\n\nPlease answer the query: {state['search_query']}"
+        # However, the existing web_searcher_instructions already asked the model to "generate a comprehensive summary".
+        # So, we'll assume the search_result_text is the summary, and then let OpenAI refine it if needed,
+        # or simply use it as is if the model is Gemini.
+
+        # For OpenAI, let's re-run the web_searcher_instructions with the context from Gemini search
+        # This is a bit indirect. A better way would be to have a dedicated summarization prompt.
+        prompt_for_openai_summarization = web_searcher_instructions.format(
+            current_date=get_current_date(),
+            research_topic=state["search_query"] + f"\n\nUse the following information to answer:\n{search_result_text}"
+        )
+        generated_text_response = llm_for_summarization.invoke(prompt_for_openai_summarization)
+        generated_text = generated_text_response.content
+
+    else: # Gemini model was used for search_model_name
+        # The search_response.text already contains the generated content from Gemini
+        generated_text = search_result_text
+
+    modified_text = insert_citation_markers(generated_text, citations)
     sources_gathered = [item for citation in citations for item in citation["segments"]]
 
     return {
         "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
+        "search_query": [state["search_query"]], # Keep track of the original query for this result
         "web_research_result": [modified_text],
     }
 
@@ -153,7 +216,10 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     configurable = Configuration.from_runnable_config(config)
     # Increment the research loop count and get the reasoning model
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
+    # The line below had configurable.reasoning_model, it should be reflection_model
+    # reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
+    model_name = configurable.reflection_model
+
 
     # Format the prompt
     current_date = get_current_date()
@@ -162,13 +228,29 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+
+    llm: BaseChatModel
+    if model_name.startswith(("gpt-", "text-davinci-")):
+        openai_api_key = configurable.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY is not set for OpenAI model")
+        llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=openai_api_key,
+            temperature=1.0,
+            max_retries=2,
+        )
+    else:  # Assume Gemini model
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is not set for Gemini model")
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=gemini_api_key,
+            temperature=1.0,
+            max_retries=2,
+        )
+
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
     return {
@@ -231,7 +313,9 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         Dictionary with state update, including running_summary key containing the formatted final summary with sources
     """
     configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
+    # The line below had configurable.reasoning_model, it should be answer_model
+    # reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
+    model_name = configurable.answer_model
 
     # Format the prompt
     current_date = get_current_date()
@@ -241,13 +325,27 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    llm: BaseChatModel
+    if model_name.startswith(("gpt-", "text-davinci-")):
+        openai_api_key = configurable.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY is not set for OpenAI model")
+        llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=openai_api_key,
+            temperature=0,
+            max_retries=2,
+        )
+    else:  # Assume Gemini model
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is not set for Gemini model")
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=gemini_api_key,
+            temperature=0,
+            max_retries=2,
+        )
     result = llm.invoke(formatted_prompt)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered

@@ -29,10 +29,34 @@ Follow these steps to get the application running locally for development and te
 
 -   Node.js and npm (or yarn/pnpm)
 -   Python 3.8+
--   **`GEMINI_API_KEY`**: The backend agent requires a Google Gemini API key.
+-   **API Keys & Model Configuration**: The backend agent requires API keys for the language models it uses.
     1.  Navigate to the `backend/` directory.
     2.  Create a file named `.env` by copying the `backend/.env.example` file.
-    3.  Open the `.env` file and add your Gemini API key: `GEMINI_API_KEY="YOUR_ACTUAL_API_KEY"`
+    3.  Open the `.env` file and add your API keys.
+
+    *   **For Google Gemini Models (Default):**
+        *   Set your Gemini API key: `GEMINI_API_KEY="YOUR_GEMINI_API_KEY"`
+        *   The agent defaults to using Gemini models (e.g., `gemini-1.5-flash`) for various tasks like query generation, reflection, and answer synthesis. You can see the defaults in `backend/src/agent/configuration.py`.
+
+    *   **For OpenAI Models:**
+        *   The agent also supports OpenAI models (e.g., "gpt-4", "gpt-3.5-turbo").
+        *   To use OpenAI models, you must set your OpenAI API key: `OPENAI_API_KEY="YOUR_OPENAI_API_KEY"`
+        *   You can then specify which tasks should use an OpenAI model by setting the relevant environment variables. For example, to use "gpt-4" for query generation and "gpt-3.5-turbo" for the final answer, you would set:
+            ```env
+            QUERY_GENERATOR_MODEL="gpt-4"
+            ANSWER_MODEL="gpt-3.5-turbo"
+            # REFLECTION_MODEL can also be set similarly
+            ```
+        *   **Important for `web_research` node:** If the `web_research` functionality is used (which is a core part of the agent), `GEMINI_API_KEY` is **still required** even if other parts of the agent use OpenAI models. This is because the `web_research` node currently uses the Google Search tool via the `google.generativeai` SDK, which needs a Gemini API key for its operation.
+
+    *   **Example `.env` for using primarily OpenAI models (but retaining web search):**
+        ```env
+        GEMINI_API_KEY="YOUR_GEMINI_API_KEY_FOR_SEARCH"
+        OPENAI_API_KEY="YOUR_OPENAI_API_KEY"
+        QUERY_GENERATOR_MODEL="gpt-4"
+        REFLECTION_MODEL="gpt-4"
+        ANSWER_MODEL="gpt-3.5-turbo"
+        ```
 
 **2. Install Dependencies:**
 
@@ -67,11 +91,11 @@ The core of the backend is a LangGraph agent defined in `backend/src/agent/graph
 
 ![Agent Flow](./agent.png)
 
-1.  **Generate Initial Queries:** Based on your input, it generates a set of initial search queries using a Gemini model.
+1.  **Generate Initial Queries:** Based on your input, it generates a set of initial search queries using a configurable language model (defaulting to Gemini).
 2.  **Web Research:** For each query, it uses the Gemini model with the Google Search API to find relevant web pages.
 3.  **Reflection & Knowledge Gap Analysis:** The agent analyzes the search results to determine if the information is sufficient or if there are knowledge gaps. It uses a Gemini model for this reflection process.
 4.  **Iterative Refinement:** If gaps are found or the information is insufficient, it generates follow-up queries and repeats the web research and reflection steps (up to a configured maximum number of loops).
-5.  **Finalize Answer:** Once the research is deemed sufficient, the agent synthesizes the gathered information into a coherent answer, including citations from the web sources, using a Gemini model.
+5.  **Finalize Answer:** Once the research is deemed sufficient, the agent synthesizes the gathered information into a coherent answer, including citations from the web sources, using a configurable language model (defaulting to Gemini).
 
 ## Deployment
 
@@ -105,4 +129,4 @@ Open your browser and navigate to `http://localhost:8123/app/` to see the applic
 
 ## License
 
-This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details. 
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.

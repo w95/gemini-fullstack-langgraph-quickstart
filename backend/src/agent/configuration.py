@@ -29,6 +29,8 @@ class Configuration(BaseModel):
         },
     )
 
+    OPENAI_API_KEY: Optional[str] = None
+
     number_of_initial_queries: int = Field(
         default=3,
         metadata={"description": "The number of initial search queries to generate."},
